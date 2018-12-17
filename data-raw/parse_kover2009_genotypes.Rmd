@@ -1,0 +1,568 @@
+---
+title: "Parse Kover et al. 2009 SNP data"
+author: "Hugo Tavares"
+date: "5 October 2018"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Summary
+
+This document goes through the process of parsing the genotype data originally 
+described in [Kover et al. (2009)](https://doi.org/10.1371/journal.pgen.1000551) 
+and converting it to a [R/qtl2 `cross2` object](https://kbroman.org/qtl2/assets/vignettes/input_files.html).
+
+The data are downloaded from Richard Mott's server, currently hosted at:
+http://mtweb.cs.ucl.ac.uk/mus/www/magic/.
+
+According to the website's description:
+
+> Note that the original 2009 paper used only 527 MAGIC lines and was based on the TAIR8 genome. 
+The data and resources for MAGIC now available on this page have been expanded to 703 genotyped 
+lines and the SNPs remapped to TAIR9/TAIR10.
+
+This fact might explain some discrepancies in the SNP coordinates between the data 
+processed here and [the data processed by Karl Broman](https://github.com/rqtl/qtl2data/tree/master/ArabMAGIC), 
+who used the supplementary file from [Gnan et al. (2014)](https://doi.org/10.1534/genetics.114.170746).
+
+Despite the fact that these are not the actual original data published by 
+[Kover et al. (2009)](https://doi.org/10.1371/journal.pgen.1000551), the final 
+`cross2` object will be saved as `kover2009`. 
+
+
+# Setup
+
+```{r}
+# Load packages
+library(tidyverse)
+
+# Make directory for files
+dir.create("downloaded_files")
+dir.create("tidy_files")
+```
+
+# Download data
+
+```{r}
+# Genotype files source
+magic_server <- "http://mtweb.cs.ucl.ac.uk/mus/www/magic/"
+geno_magic <- "magic.15012010.tar.gz"
+
+# Download the files
+download.file(file.path(magic_server, geno_magic), 
+              file.path("downloaded_files", geno_magic), 
+              method = "wget")
+
+# Untar the MAGIC genotypes
+untar(file.path("downloaded_files", geno_magic), exdir = "downloaded_files")
+```
+
+# Parse files
+
+The format of these files is quite unconventional. 
+
+Here, I try to parse them to obtain tabular formats, which are needed for `R/qtl2`
+package.
+
+For each chromosome there's 3 sets of files with the following extensions:
+
+* ".alelles" - these contain information about the genotypes of the founder accessions ("strains")
+* ".data" - these contain information about the genotypes of the MAGIC lines
+* ".map" - this contains information about each marker
+
+### Parse founder genotypes (".alleles" files)
+
+My understanding is that this file contains the prior probability of each 
+accession/strain state in that marker. 
+So, if 3 accessions/strains share the same nucleotide allele, there is a 1/3 
+prior chance that an individual with that allele inherited this allele from each of those accessions. 
+
+This is the most challenging file format of the bunch. First I break down my 
+understanding of the file format. Then I have a chunk of code that parses it.
+
+Here's the first 10 lines of one of the files:
+
+```{r}
+read_lines("downloaded_files/chr1.MAGIC.alleles", n_max = 10)
+```
+
+* The first line has information about the number of markers in the file 
+and the number of founders ("strains")
+* The second line has the names of these "strains"
+* The remainder of the file contains 4 lines for each marker
+
+Regarding the last point, this is what the four lines for each marker refer to:
+
+* First line is the marker name, its chromosome and its map position
+* Second line is the probability of missing genotype for each strain (assumed equal for all strains)
+* Third line is the probability of allele X for each strain
+* Fourth line is the probability of allele Y for each strain
+
+Regarding the first of those lines, this is the information it contains, tab-separated:
+
+```{r}
+read_lines("downloaded_files/chr1.MAGIC.alleles", skip = 2, n_max = 1)
+```
+
+* The word "marker"
+* the marker name
+* the number 3 (what is this?)
+* the chromosome number
+* the position of the marker (in centimorgan, I assume)
+
+So, here's the code chunk that processes these different parts, into four tables (per chromosome), 
+one with marker information, one with probability of missing genotype, one with 
+probability of allele 1 and another with probability of allele 2.
+
+```{r}
+tidy_founders <- list.files("downloaded_files/", pattern = ".alleles", full.names = TRUE) %>%
+  map(function(chr_file) {
+    
+    # The first line of the file has information about the number of markers in the
+    ## file and the number of founders ("strains")
+    n_markers <- read_tsv(chr_file, n_max = 1, col_names = FALSE) %>% pull(X2)
+    n_strains <- read_tsv(chr_file, n_max = 1, col_names = FALSE) %>% pull(X4)
+
+    # The second line has the names of these "strains"
+    strain_ids <- read_tsv(chr_file, skip = 1, n_max = 1, col_names = FALSE) %>%
+      select(-X1) %>%
+      unlist() %>%
+      unname()
+
+    # Extract the lines with marker information (every 4th value starting at line 3 of the file)
+    # V1 = word "marker"
+    # V2 = the marker name
+    # V3 = the number 3 (what is this?)
+    # V4 = the chromosome number
+    # V5 = the position of the marker (in centimorgan, I assume)
+    markers <- read_lines(chr_file, skip = 2)[seq(1, n_markers * 4, by = 4)] %>%
+      map_dfr(function(i) {
+        read.table(text = i, sep = "\t", header = FALSE, stringsAsFactors = FALSE)
+      }) %>%
+      select(marker = V2, chrom = V4, map = V5) %>%
+      as_tibble()
+
+    # Extract the missing genotype information (every 4th value starting at line 4 of the file)
+    # V1 = word "allele"
+    # V2 = the value "NA"
+    # V3-V21 = the probability that this genotype is missing in the respective founder strain
+    na_prob <- read_lines(chr_file, skip = 3)[seq(1, n_markers * 4, by = 4)] %>%
+      map_dfr(function(i) {
+        read.table(text = i, sep = "\t", 
+                   header = FALSE, stringsAsFactors = FALSE)
+      }) %>%
+      select(V2:V21)
+    names(na_prob) <- c("allele", strain_ids)
+
+    # Extract genotype information for first allele (every 4th value starting at line 5 of the file)
+    # V1 = word "allele"
+    # V2 = the allele
+    # V3-V21 = the probability that this strain carries the respective allele
+    allele1_prob <- read_lines(chr_file, skip = 4)[seq(1, n_markers * 4, by = 4)] %>%
+      map_dfr(function(i) {
+        read.table(
+          text = i, sep = "\t", header = FALSE, 
+          colClasses = c("character", "character", rep("numeric", 19))
+        )
+      }) %>%
+      select(V2:V21)
+    names(allele1_prob) <- c("allele", strain_ids)
+
+    # Extract genotype information for second allele (every 4th value starting at line 6 of the file)
+    # V1 = word "allele"
+    # V2 = the allele
+    # V3-V21 = the probability that this strain carries the respective allele
+    allele2_prob <- read_lines(chr_file, skip = 5)[seq(1, n_markers * 4, by = 4)] %>%
+      map_dfr(function(i) {
+        read.table(
+          text = i, sep = "\t", header = FALSE, 
+          colClasses = c("character", "character", rep("numeric", 19))
+        )
+      }) %>%
+      select(V2:V21)
+    names(allele2_prob) <- c("allele", strain_ids)
+    
+    # Make some sanity checks
+    if(nrow(markers) == n_markers & 
+       nrow(na_prob) == n_markers &
+       nrow(allele1_prob) == n_markers &
+       nrow(allele2_prob) == n_markers){
+      list(bind_cols(markers, na_prob), 
+         bind_cols(markers, allele1_prob), 
+         bind_cols(markers, allele2_prob))
+    } else {
+      stop("the number of rows didn't match")
+    }
+
+  })
+
+# Bind each chromosome's table together
+## pmap is useful here - parallel map across the list of lists
+tidy_founders <- pmap(tidy_founders, bind_rows)
+
+# Now bind these further into a single table
+tidy_founders <- bind_rows(tidy_founders)
+```
+
+This is the output we get:
+
+```{r}
+tidy_founders %>% 
+  arrange(chrom, map, marker, !is.na(allele))
+```
+
+And we have `r nrow(tidy_founders)/3` markers.
+
+I don't quite understand the missing allele probability, because it's 1/19 for 
+every strain in every marker:
+
+```{r}
+tidy_founders %>% 
+  filter(is.na(allele)) %>% 
+  filter_at(vars(Bur:Zu), any_vars(. != round(1/19, 3)))
+```
+
+However, we can see that some markers do have missing allele information, some of 
+them for quite a lot of the parental strains:
+
+```{r}
+tidy_founders %>% 
+  gather("strain", "prob", Bur:Zu) %>% 
+  group_by(marker, strain) %>% 
+  summarise(allele = allele[which.max(prob)]) %>% 
+  filter(is.na(allele)) %>% 
+  count(marker) %>% 
+  arrange(desc(n))
+```
+
+Not sure how that information is used by `happy.hbrem::happy()` function, but 
+perhaps this affects imputation in some of these markers.
+
+
+### Parse MAGIC genotypes (".data" files)
+
+This is a more straightforward space-delimited text file:
+
+```{r}
+read_delim("downloaded_files/chr1.MAGIC.data", n_max = 10, col_names = FALSE, 
+            col_types = cols(.default = col_character()), delim = " ")
+```
+
+But we need to ensure that the markers are named correctly. So I extract the
+marker names from the ".alleles" files:
+
+```{r}
+geno <- map(1:5, function(i){
+  
+  # Get the marker names
+  # Read the lines of the file
+  # subset the lines to contain the word marker
+  # collapse vector using "newline" to recreate a "tsv" file
+  # use read.table with text option to read this as a table
+  # extract the second column that contains the marker name
+  markers <- read_lines(paste0("downloaded_files/chr", i, ".MAGIC.alleles"), skip = 2) %>% 
+    str_subset("marker") %>% 
+    str_c(collapse = "\n") %>% 
+    read.table(text = ., 
+               sep = "\t", header = FALSE, stringsAsFactors = FALSE) %>% 
+    pull(V2)
+  
+  # Read the genotypes file
+  geno <- read_delim(paste0("downloaded_files/chr", i, ".MAGIC.data"), col_names = FALSE, 
+                     col_types = cols(.default = col_character()), delim = " ")
+  
+  # The first 6 columns are mostly missing data. Retain only the first column (ID)
+  # and every other column starting at 7. We retain only every other column because 
+  # all sites are homozygous
+  geno <- geno %>% 
+    select(1, seq(7, ncol(geno), by = 2))
+  
+  # Add informative column names
+  colnames(geno) <- c("line", markers)
+  
+  return(geno)
+})
+
+# Join all the genotypes - see http://www.brodrigues.co/blog/2016-07-30-merge-a-list-of-datasets-together/
+geno <- Reduce(function(x, y) full_join(x, y, by = "line"), geno)
+```
+
+
+Note: the published genotypes (https://doi.org/10.1371/journal.pgen.1000551.s003) 
+seem to have the wrong alleles, at least compared to what is available from 
+http://signal.salk.edu/atg1001/3.0/gebrowser.php browser. See block of code 
+below for an example:
+
+```{r, eval=FALSE}
+kover2009 <- read_tsv("https://journals.plos.org/plosgenetics/article/file?id=10.1371/journal.pgen.1000551.s003&type=supplementary", col_types = cols(.default = col_character()))
+
+kover2009 <- kover2009 %>% 
+  filter(!str_detect(line, "MAGIC") & str_detect(line, "-"))
+
+kover2009 <- kover2009 %>% gather("marker", "genotype", -line) %>% 
+  mutate(line = str_remove(line, "-.*"))
+
+# Compare these two
+kover2009 %>% filter(marker == "CRY2_1021")
+
+tidy_founders %>% 
+  gather("line", "prob", Bur:Zu) %>% 
+  group_by(marker, line) %>% 
+  filter(prob == max(prob)) %>% 
+  ungroup() %>% 
+  select(marker, line, allele) %>% 
+  filter(marker == "CRY2_1021")
+```
+
+
+### Parse marker coordinates (".map" files)
+
+These are tab-delimited and reasonably simple.
+
+```{r}
+markers_map <- list.files("downloaded_files/", pattern = ".map", full.names = TRUE) %>% 
+  map_dfr(read_tsv, col_types = "cccii")
+```
+
+However, not all `r nrow(markers_map)` markers in this map are in the genotype data. 
+
+```{r}
+sum(markers_map$marker %in% colnames(geno))
+```
+
+This means we lack physical location information for 9 markers. 
+We could remove those from the dataset, although one might consider retaining them in the future...
+
+```{r}
+# Retain only markers with genotype data
+markers_map <- markers_map %>% 
+  filter(marker %in% colnames(geno))
+
+# Retain only genotypes for markers with map information
+geno <- geno[, c("line", markers_map$marker)]
+
+# Retain only founder genotypes for those markers
+tidy_founders <- tidy_founders %>% 
+  filter(marker %in% markers_map$marker)
+```
+
+It's worth noting that the genetic map location of markers from the `tidy_founders` 
+table is a linear function of the physical location:
+
+```{r}
+full_join(markers_map, select(tidy_founders, marker, map), by = "marker") %>% 
+  ggplot(aes(bp, map)) + geom_point()
+```
+
+Finally, I produce a table with the reference (Col-0) allele at each marker:
+
+```{r}
+ref_allele <- tidy_founders %>% 
+  group_by(marker) %>% 
+  summarise(ref = allele[which(Col == max(Col))])
+head(ref_allele)
+```
+
+
+# Summary
+
+This parsing resulted in four files:
+
+* `tidy_founders` which contains genotype information for the founders
+* `geno` which contains genotype information for the MAGIC lines
+* `markers_map` which contains physical map information for each marker
+* `ref_allele` which contains the reference allele for each marker
+
+```{r}
+head(tidy_founders)
+head(geno)
+head(markers_map)
+```
+
+Each of these contains all the relevant information from Kover et al. 2009 
+in a tidy set of tables.
+
+
+# Export files for R/happy.hbrem
+
+Instead of exporting one file per chromosome, we export a single set of files for 
+all chromosomes (the files aren't that big).
+
+From the `tidy_founders` table, we need some gimnastics to write into the `happy` 
+format:
+
+```{r}
+# First line of file contains number of markers and number of strains
+paste("markers", length(unique(tidy_founders$marker)), "strains 19", sep = "\t") %>% 
+  write_lines("tidy_files/kover2009_happy_alleles.txt")
+
+# Second line contains the strain names
+"strain_names\tBur\tCan\tCol\tCt\tEdi\tHi\tKn\tLer\tMt\tNo\tOy\tPo\tRsch\tSf\tTsu\tWil\tWs\tWu\tZu" %>% 
+  write_lines("tidy_files/kover2009_happy_alleles.txt", append = TRUE)
+
+# Further lines contain information about each marker
+## Here I nest the table, to write each marker sequentially
+temp <- tidy_founders %>% 
+  mutate(marker_header = paste("marker", marker, "3", chrom, map, sep = "\t")) %>% 
+  group_by(marker, chrom, map) %>% 
+  nest()
+
+walk(temp$data, function(i){
+  # This appends the marker header information into the file
+  i$marker_header %>% 
+    unique() %>% 
+    write_lines("tidy_files/kover2009_happy_alleles.txt", append = TRUE)
+  
+  # This appends the rest of the information for each allele
+  i %>% 
+    mutate(prefix = "allele") %>% 
+    select(prefix, allele, Bur:Zu) %>% 
+    write_tsv("tidy_files/kover2009_happy_alleles.txt", append = TRUE)
+})
+
+rm(temp)
+```
+
+We can also write the ".ped" file, which needs two columns for each marker, as 
+well as 6 columns in the beginning:
+
+```{r}
+cbind(geno[, 1], geno[, 1], 0, 0, NA, NA, geno[, rep(2:ncol(geno), each = 2)]) %>% 
+  write_tsv("tidy_files/kover2009_happy_genotypes.ped", col_names = FALSE)
+```
+
+Finally, the map file is just straightforward written out:
+
+```{r}
+markers_map %>% 
+  write_tsv("tidy_files/kover2009_happy_markers.map")
+```
+
+
+
+# Write out files for R/qtl2
+
+R/qtl2 requires the following files 
+([more details here](http://kbroman.org/qtl2/assets/vignettes/input_files.html)):
+
+* A `json` file with information about the cross
+* Two `csv` files with MAGIC and founder genotypes with an `ID` column + a column for each marker
+    * genotypes encoded as 1 (homozygous reference), 2 (heterozygous) and 3 (homozygous alternative)
+    * use `NA` for missing genotypes
+* Two `csv` files for genetic and physical maps with columns `marker,chr,pos`
+
+
+### JSON file
+
+```{r}
+'{
+  "description": "Arabidopsis MAGIC",
+  "crosstype": "magic19",
+	"sep": ",",
+  "comment.char": "#",
+  "geno": "kover2009_qtl2_geno.csv",
+  "founder_geno": "kover2009_qtl2_founders.csv",
+  "genotypes": {
+    "1": "1",
+    "2": "2",
+    "3": "3"
+  },
+  "gmap": "kover2009_qtl2_gmap.csv",
+  "pmap": "kover2009_qtl2_pmap.csv",
+  "alleles": ["Bur", "Can", "Col", "Ct", "Edi", "Hi", "Kn", "Ler", "Mt", "No", "Oy", "Po", "Rsch", "Sf", "Tsu", "Wil", "Ws", "Wu", "Zu"]
+}' %>% 
+  write_lines("./tidy_files/kover2009_qtl2.json")
+```
+
+
+### MAGIC genotypes
+
+To convert the genotypes to R/qtl2 format we convert each genotype to numeric code 
+using "1" for reference and "3" for alternative allele (all sites are homozygous, 
+so there is no "2" category).
+
+```{r}
+geno %>% 
+  gather("marker", "allele", -line) %>% 
+  left_join(ref_allele, by = "marker") %>% 
+  mutate(allele = ifelse(allele == ref, "1", "3")) %>% 
+  select(-ref) %>% 
+  spread(marker, allele) %>% 
+  rename(ID = line) %>% 
+  write_csv("./tidy_files/kover2009_qtl2_geno.csv")
+```
+
+
+#### Founder genotypes
+
+A similar thing is done for the founder genotypes:
+
+```{r}
+# Need to 
+founders_geno <- tidy_founders %>% 
+  group_by(marker) %>% 
+  # extract the allele with highest probability
+  summarise_at(vars(Bur:Zu), 
+               funs(allele[which(. == max(.))])) %>% 
+  # add a reference allele
+  left_join(ref_allele, by = "marker") %>% 
+  # convert genotypes to numeric categories
+  mutate_at(vars(-marker, -ref), funs(ifelse(. == ref, "1", "3"))) %>% 
+  select(-ref)
+```
+
+```{r}
+head(founders_geno)
+```
+
+This table needs to be transposed though
+
+```{r}
+# Transpose the table
+founders_geno <- founders_geno %>% 
+  as.data.frame() %>% 
+  column_to_rownames("marker") %>% 
+  as.matrix() %>% 
+  t() %>% 
+  as_tibble(rownames = "ID")
+
+head(founders_geno)
+```
+
+
+```{r}
+founders_geno %>% 
+  write_csv("./tidy_files/kover2009_qtl2_founders.csv")
+```
+
+
+### Genetic and physical maps
+
+```{r}
+markers_map %>% 
+  select(marker, chr = chromosome, pos = bp) %>% 
+  write_csv("./tidy_files/kover2009_qtl2_pmap.csv")
+
+tidy_founders %>% 
+  distinct(marker, chr = chrom, pos = map) %>% 
+  write_csv("./tidy_files/kover2009_qtl2_gmap.csv")
+```
+
+
+### Create R/qtl2 object
+
+```{r}
+kover2009 <- qtl2::read_cross2("./tidy_files/kover2009_qtl2.json")
+usethis::use_data(kover2009, overwrite = TRUE, compress = "xz")
+```
+
+
+```{r}
+# Remove directories
+unlink("downloaded_files/", recursive = TRUE)
+unlink("tidy_files/", recursive = TRUE)
+```
+

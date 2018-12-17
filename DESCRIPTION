@@ -1,0 +1,19 @@
+Package: atMAGIC
+Type: Package
+Title: Data package with R/qtl2 objects for the Arabidopsis MAGIC lines
+Version: 0.1.0
+Author: Hugo Tavares <hugo.tavares@slcu.cam.ac.uk>
+Maintainer: Hugo Tavares <hugo.tavares@slcu.cam.ac.uk>
+Description: The R/atMAGIC data package provides with R/qtl2 cross2 objects for
+              the Arabidopsis MAGIC lines originally published by Kover et al 2009.
+Depends:
+  qtl2,
+  R (>= 3.1.0)
+Suggests: 
+  tidyverse,
+  knitr
+License: GPL-3
+Encoding: UTF-8
+LazyData: true
+VignetteBuilder: knitr
+RoxygenNote: 6.1.0
