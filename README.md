@@ -68,7 +68,15 @@ kover2009_probs <- calc_genoprob(kover2009)
 # Run a QTL scan
 out <- scan1(kover2009_probs, kover2009$pheno)
 
+# Run permutations for genome-wide threshold (increase n_perm in real analysis)
+kover2009_perm <- scan1perm(kover2009_probs, kover2009$pheno, n_perm = 10)
+kover2009_threshold <- summary(kover2009_perm)
+
 # Quick visualisation
-plot(out, kover2009$pmap, lodcolumn = "days.to.bolt")
+plot(kover2009_scan, kover2009$pmap, lodcolumn = "days.to.bolt")
+abline(h = kover2009_threshold[,"days.to.bolt"])
+
+# Find peaks above certain threshold (should base it on permutation threshold from above)
+find_peaks(kover2009_scan, kover2009$pmap, threshold = 10)
 ```
 
